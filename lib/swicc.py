@@ -1,6 +1,5 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import serial
 import serial.tools.list_ports
 import threading
 import time
@@ -10,6 +9,7 @@ import ctypes
 import platform
 import sv_ttk
 import pywinstyles
+from swicc_core import SwiccController
 
 try:
     if platform.system() == "Windows":
@@ -52,7 +52,14 @@ I18N = {
         "log_thread_crash": "时序执行子线程抛出异常: {}",
         "log_macro_finish": "自动化指令序列已被完整消费，总线现已恢复空闲状态。",
         "warn_no_port": "通信参数缺失：请先在下拉列表中指定目标串行端口。",
-        "warn_no_conn": "连接未建立：执行此操作前必须建立有效的底层串口链路。"
+        "warn_no_conn": "连接未建立：执行此操作前必须建立有效的底层串口链路。",
+        "import_image": "导入绘图图片",
+        "start_image_draw": "进入矢量高速仿真预览",
+        "stop_image_draw": "终止自动绘制",
+        "log_img_load_success": "图像加载及几何边界拓扑完成，共提取出 {} 条连续矢量轮廓线。",
+        "log_img_draw_start": "图像自动化矢量连续绘制流已激活。",
+        "log_img_draw_finish": "矢量轮廓动作流实机绘制完毕，总线现已恢复空闲状态。",
+        "log_img_draw_cancel": "图像自动绘制已被用户强行终止，总线已安全释放。"
     },
     "en_US": {
         "title": "SwiCC Advanced Host Controller - Native Edition",
@@ -88,20 +95,94 @@ I18N = {
         "log_thread_crash": "Execution thread threw an exception: {}",
         "log_macro_finish": "Command sequence fully consumed. Bus is idle.",
         "warn_no_port": "Missing parameters: Please specify a port.",
-        "warn_no_conn": "Connection error: Must establish serial link first."
+        "warn_no_conn": "Connection error: Must establish serial link first.",
+        "import_image": "Import Image",
+        "start_image_draw": "Enter Vector High-Speed Preview",
+        "stop_image_draw": "Terminate Auto Draw",
+        "log_img_load_success": "Image model complete. Found {} continuous contours.",
+        "log_img_draw_start": "Image automated vector drawing sequence started.",
+        "log_img_draw_finish": "Vector sequence consumed. Bus is idle.",
+        "log_img_draw_cancel": "Image drawing forcefully terminated by user. Bus is safe."
     }
 }
+
+class DrawingPreviewWindow:
+    def __init__(self, parent, commands, confirm_callback):
+        self.top = tk.Toplevel(parent)
+        self.top.title("矢量轮廓路径 100x 高速仿真推演器")
+        self.top.geometry("560x620")
+        self.top.resizable(False, False)
+        
+        self.commands = commands
+        self.confirm_callback = confirm_callback
+        
+        self.canvas = tk.Canvas(self.top, width=512, height=512, bg="#1a1a1a", highlightthickness=0)
+        self.canvas.pack(pady=15)
+        
+        btn_frame = ttk.Frame(self.top)
+        btn_frame.pack(fill="x", side="bottom", pady=15, padx=24)
+        
+        self.confirm_btn = ttk.Button(btn_frame, text="确认写入实机 (Confirm Vector Draw)", command=self.confirm, state="disabled", style="Accent.TButton")
+        self.confirm_btn.pack(side="right", padx=6)
+        
+        self.cancel_btn = ttk.Button(btn_frame, text="放弃当前序列 (Cancel)", command=self.top.destroy)
+        self.cancel_btn.pack(side="right", padx=6)
+        
+        self.curr_x, self.curr_y = 128, 128
+        self.is_pen_down = False
+        self.cmd_index = 0
+        self.scale = 2
+        
+        pywinstyles.apply_style(self.top, "mica")
+        pywinstyles.change_header_color(self.top, color="#202020")
+        self.animate()
+        
+    def animate(self):
+        batch_size = 50
+        for _ in range(batch_size):
+            if self.cmd_index >= len(self.commands):
+                self.confirm_btn.config(state="normal")
+                return
+            
+            cmd = self.commands[self.cmd_index]
+            cmd_type = cmd.get("type")
+            
+            if cmd_type == "pen_down":
+                self.is_pen_down = True
+            elif cmd_type == "pen_up":
+                self.is_pen_down = False
+            elif cmd_type == "move":
+                dx = cmd.get("dx", 0)
+                dy = cmd.get("dy", 0)
+                next_x = self.curr_x + dx
+                next_y = self.curr_y + dy
+                
+                if self.is_pen_down:
+                    self.canvas.create_line(
+                        self.curr_x * self.scale, self.curr_y * self.scale,
+                        next_x * self.scale, next_y * self.scale,
+                        fill="#4cc9f0", width=2
+                    )
+                self.curr_x, self.curr_y = next_x, next_y
+                
+            self.cmd_index += 1
+            
+        self.top.after(1, self.animate)
+        
+    def confirm(self):
+        self.top.destroy()
+        self.confirm_callback()
 
 class SwiccAdvancedHostApp:
     def __init__(self, root):
         self.root = root
         self.current_lang = "zh_CN"
         
-        self.root.geometry("1450x980")
-        self.root.minsize(1200, 850) 
+        self.root.geometry("1450x1050")
+        self.root.minsize(1200, 900) 
         self.root.maxsize(3840, 2160)
 
-        self.serial_port = None
+        self.controller = SwiccController()
         self.is_connected = False
         self.state = [0x00, 0x00, 0x08, 0x80, 0x80, 0x80, 0x80]
         self.is_recording = False
@@ -109,6 +190,9 @@ class SwiccAdvancedHostApp:
         self.current_step_start = 0
         self.last_hex_str = "00000880808080"
         self.base_scaling = self.root.tk.call('tk', 'scaling')
+        self.extracted_contours = None
+        
+        self.drawing_requested_cancel = threading.Event()
 
         self.setup_ui()
         self.scan_ports()
@@ -124,14 +208,12 @@ class SwiccAdvancedHostApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        # ---------------- 顶部控制栏 (全面改为带有权重分配的 Grid 结构) ----------------
         conn_frame = ttk.Frame(self.root)
         conn_frame.grid(row=0, column=0, sticky="ew", padx=30, pady=(30, 15))
         
-        # 配置列扩展权重，防止大分辨率下拉伸变形
         for c in range(8):
             conn_frame.columnconfigure(c, weight=0)
-        conn_frame.columnconfigure(4, weight=1) # 留白列，用于将状态挤到最右侧
+        conn_frame.columnconfigure(4, weight=1)
 
         self.port_label = ttk.Label(conn_frame, text="")
         self.port_label.grid(row=0, column=0, padx=(0, 5), pady=5, sticky="w")
@@ -146,7 +228,6 @@ class SwiccAdvancedHostApp:
         self.connect_btn = ttk.Button(conn_frame, text="", command=self.toggle_connection)
         self.connect_btn.grid(row=0, column=3, padx=10, pady=5)
 
-        # 留空组件，占领中央多余空间
         ttk.Frame(conn_frame).grid(row=0, column=4, sticky="nsew")
 
         self.status_label = ttk.Label(conn_frame, text="", font=("Segoe UI", 13, "bold"))
@@ -168,7 +249,6 @@ class SwiccAdvancedHostApp:
         self.lang_combo.grid(row=1, column=3, padx=5, pady=10, sticky="ew")
         self.lang_combo.bind("<<ComboboxSelected>>", self.change_language)
 
-        # ---------------- 主体物理手柄面板 ----------------
         main_frame = ttk.Frame(self.root)
         main_frame.grid(row=1, column=0, sticky="nsew", padx=30, pady=10)
         main_frame.columnconfigure(0, weight=1)
@@ -200,13 +280,12 @@ class SwiccAdvancedHostApp:
         self.setup_joystick(self.right_panel, "R-Stick", 5, 6).grid(row=2, column=0, columnspan=3, pady=25)
         self.create_button(self.right_panel, "R-Click", 0, 0x08).grid(row=3, column=0, columnspan=3, pady=10, sticky="ew")
 
-        # ---------------- 底部高级宏控制栏 (全面重构为不发生强行折行的 Grid) ----------------
         macro_frame = ttk.Frame(self.root)
         macro_frame.grid(row=2, column=0, sticky="ew", padx=30, pady=15)
         
         for mc in range(7):
             macro_frame.columnconfigure(mc, weight=0)
-        macro_frame.columnconfigure(6, weight=1) # 留白权重
+        macro_frame.columnconfigure(6, weight=1)
 
         self.record_btn = ttk.Button(macro_frame, text="", command=self.start_recording, style="Accent.TButton")
         self.record_btn.grid(row=0, column=0, padx=(0, 10), pady=5)
@@ -234,8 +313,20 @@ class SwiccAdvancedHostApp:
         self.play_btn = ttk.Button(macro_frame, text="", command=self.load_and_play_macro, style="Accent.TButton")
         self.play_btn.grid(row=0, column=7, padx=(10, 0), pady=5, sticky="e")
 
+        image_draw_frame = ttk.Frame(self.root)
+        image_draw_frame.grid(row=3, column=0, sticky="ew", padx=30, pady=15)
+
+        self.import_img_btn = ttk.Button(image_draw_frame, text="", command=self.import_image_file, style="Accent.TButton")
+        self.import_img_btn.grid(row=0, column=0, padx=(0, 10), pady=5)
+
+        self.draw_img_btn = ttk.Button(image_draw_frame, text="", command=self.start_vector_drawing_plan, state="disabled")
+        self.draw_img_btn.grid(row=0, column=1, padx=5, pady=5)
+        
+        self.stop_draw_btn = ttk.Button(image_draw_frame, text="", command=self.stop_image_drawing_execution, state="disabled")
+        self.stop_draw_btn.grid(row=0, column=2, padx=10, pady=5)
+
         self.log_text = tk.Text(self.root, height=6, bg="#1e1e1e", fg="#cccccc", font=("Consolas", 14), relief="flat")
-        self.log_text.grid(row=3, column=0, sticky="ew", padx=30, pady=(0, 30))
+        self.log_text.grid(row=4, column=0, sticky="ew", padx=30, pady=(0, 30))
         self.log_text.config(state="disabled")
 
     def apply_language_strings(self):
@@ -259,6 +350,9 @@ class SwiccAdvancedHostApp:
         self.loop_label.config(text=self.tr("loop_count"))
         self.interval_label.config(text=self.tr("global_interval"))
         self.play_btn.config(text=self.tr("play_macro"))
+        self.import_img_btn.config(text=self.tr("import_image"))
+        self.draw_img_btn.config(text=self.tr("start_image_draw"))
+        self.stop_draw_btn.config(text=self.tr("stop_image_draw"))
 
     def change_language(self, event=None):
         selected = self.lang_var.get()
@@ -283,7 +377,6 @@ class SwiccAdvancedHostApp:
             new_factor = self.base_scaling * percentage
             self.root.tk.call('tk', 'scaling', new_factor)
             
-            # 动态覆写并强行刷新 Tkinter 的底层 Style 引擎映射
             style = ttk.Style()
             dynamic_size = int(12 * percentage)
             style.configure(".", font=("Segoe UI", dynamic_size))
@@ -293,7 +386,8 @@ class SwiccAdvancedHostApp:
             
             self.log(self.tr("log_scale_update", scale_str))
         except Exception as e:
-            self.log(self.tr("log_scale_fail", str(e)))
+            err_msg = str(e)
+            self.log(self.tr("log_scale_fail", err_msg))
 
     def log(self, message):
         self.log_text.config(state="normal")
@@ -311,21 +405,17 @@ class SwiccAdvancedHostApp:
             messagebox.showwarning("Warning", self.tr("warn_no_port"))
             return
             
-        try:
-            self.serial_port = serial.Serial(port, 115200, timeout=0)
+        if self.controller.connect(port):
             self.is_connected = True
             self.connect_btn.config(text=self.tr("disconnect"))
             self.status_label.config(text=self.tr("status_connected"), foreground="#4cc9f0")
             self.log(self.tr("log_port_mount_success", port))
             self.send_update()
-        except Exception as e:
-            messagebox.showerror("Error", self.tr("log_port_mount_fail", str(e)))
+        else:
+            messagebox.showerror("Error", self.tr("log_port_mount_fail", "端口绑定被系统拒绝或不可用"))
 
     def close_serial(self):
-        if self.serial_port and self.serial_port.is_open:
-            self.state = [0x00, 0x00, 0x08, 0x80, 0x80, 0x80, 0x80]
-            self.send_update()
-            self.serial_port.close()
+        self.controller.disconnect()
         self.is_connected = False
         self.connect_btn.config(text=self.tr("connect"))
         self.status_label.config(text=self.tr("status_unconnected"), foreground="#ff6b6b")
@@ -336,10 +426,8 @@ class SwiccAdvancedHostApp:
 
     def send_update(self):
         hex_str = self.generate_hex_state()
-        cmd = f"+IMM {hex_str}\r\n"
-        if self.is_connected and self.serial_port and self.serial_port.is_open:
-            try: self.serial_port.write(cmd.encode('utf-8'))
-            except: pass
+        if self.is_connected:
+            self.controller.send_hex_state_str(hex_str)
 
         if self.is_recording:
             now = time.time()
@@ -460,7 +548,9 @@ class SwiccAdvancedHostApp:
                 with open(file_path, "w", encoding="utf-8") as f:
                     toml.dump({"loop": loop_count, "step": self.macro_steps}, f)
                 self.log(self.tr("log_save_success", os.path.basename(file_path)))
-            except Exception as e: messagebox.showerror("Error", self.tr("log_save_fail", str(e)))
+            except Exception as e:
+                err_msg = str(e)
+                messagebox.showerror("Error", self.tr("log_save_fail", err_msg))
 
     def load_and_play_macro(self):
         if not self.is_connected:
@@ -480,35 +570,128 @@ class SwiccAdvancedHostApp:
 
                 self.log(self.tr("log_load_success", loop_count))
                 threading.Thread(target=self.execute_advanced_playback, args=(steps, loop_count, global_interval), daemon=True).start()
-            except Exception as e: messagebox.showerror("Error", self.tr("log_load_fail"))
+            except Exception as e:
+                messagebox.showerror("Error", self.tr("log_load_fail"))
 
     def execute_advanced_playback(self, steps, loop_count, global_interval):
-        self.play_btn.config(state="disabled")
-        self.record_btn.config(state="disabled")
+        self.root.after(0, lambda: self.play_btn.config(state="disabled"))
+        self.root.after(0, lambda: self.record_btn.config(state="disabled"))
         try:
             for iteration in range(loop_count):
                 for step in steps:
-                    self.serial_port.write(f"+IMM {step.get('state', '00000880808080')}\r\n".encode('utf-8'))
+                    self.controller.send_hex_state_str(step.get('state', '00000880808080'))
                     time.sleep(step.get("duration", 100) / 1000.0)
-                    self.serial_port.write("+IMM 00000880808080\r\n".encode('utf-8'))
+                    self.controller.send_hex_state_str("00000880808080")
                     
                     total_sleep = step.get("interval", 0) + global_interval
                     if total_sleep > 0: time.sleep(total_sleep / 1000.0)
-        except Exception as e: self.log(self.tr("log_thread_crash", str(e)))
+        except Exception as e:
+            err_msg = str(e)
+            self.root.after(0, lambda msg=err_msg: self.log(self.tr("log_thread_crash", msg)))
         finally:
-            try: self.serial_port.write("+IMM 00000880808080\r\n".encode('utf-8'))
-            except: pass
+            self.controller.send_hex_state_str("00000880808080")
             self.root.after(0, lambda: self.log(self.tr("log_macro_finish")))
             self.root.after(0, lambda: self.play_btn.config(state="normal"))
             self.root.after(0, lambda: self.record_btn.config(state="normal"))
 
+    def import_image_file(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Image Files", "*.png *.jpg *.jpeg *.svg")])
+        if file_path:
+            try:
+                from image_processor import extract_vector_contours
+                self.extracted_contours = extract_vector_contours(file_path)
+                self.log(self.tr("log_img_load_success", len(self.extracted_contours)))
+                self.draw_img_btn.config(state="normal")
+            except Exception as e:
+                err_msg = str(e)
+                messagebox.showerror("Error", f"图像矢量解析失败: {err_msg}")
+
+    def start_vector_drawing_plan(self):
+        if not self.extracted_contours:
+            return
+            
+        try:
+            from path_planner import plan_vector_drawing_commands
+            all_commands = plan_vector_drawing_commands(self.extracted_contours, (128, 128))
+            
+            if all_commands:
+                try:
+                    press_ms = 45
+                    delay_ms = int(self.interval_entry.get())
+                    if delay_ms <= 0:
+                        delay_ms = 35
+                except:
+                    press_ms = 45
+                    delay_ms = 35
+                    
+                DrawingPreviewWindow(
+                    self.root, 
+                    all_commands, 
+                    lambda: self.launch_hardware_vector_drawing(all_commands, press_ms, delay_ms)
+                )
+        except Exception as e:
+            err_msg = str(e)
+            messagebox.showerror("Error", f"生成矢量路径规划失败: {err_msg}")
+
+    def launch_hardware_vector_drawing(self, commands, press_ms, delay_ms):
+        self.drawing_requested_cancel.clear()
+        self.import_img_btn.config(state="disabled")
+        self.draw_img_btn.config(state="disabled")
+        self.stop_draw_btn.config(state="normal")
+        
+        threading.Thread(
+            target=self.execute_vector_hardware_draw, 
+            args=(commands, press_ms, delay_ms), 
+            daemon=True
+        ).start()
+
+    def stop_image_drawing_execution(self):
+        self.drawing_requested_cancel.set()
+        self.stop_draw_btn.config(state="disabled")
+
+    def execute_vector_hardware_draw(self, commands, press_ms, delay_ms):
+        try:
+            self.root.after(0, lambda: self.log("正在执行绝对硬件坐标回中校准..."))
+            
+            # 正确配置全局屏幕几何中心回中参数：
+            # 屏幕中心偏移 = 640px (X轴) / 360px (Y轴)
+            # 设定物理映射率: 1步 = 2px，故步数为 320 与 180
+            self.controller.calibrate_center(
+                steps_x=320, 
+                steps_y=180, 
+                overdrive=750, 
+                press_ms=press_ms, 
+                delay_ms=delay_ms, 
+                cancel_event=self.drawing_requested_cancel
+            )
+            
+            self.root.after(0, lambda: self.log("坐标原点校准完成，开始执行连续矢量轮廓线扫描。"))
+            self.root.after(0, lambda: self.log(self.tr("log_img_draw_start")))
+            
+            self.controller.execute_vector_commands(
+                commands=commands, 
+                press_ms=press_ms, 
+                delay_ms=delay_ms, 
+                cancel_event=self.drawing_requested_cancel
+            )
+            
+            self.root.after(0, lambda: self.log(self.tr("log_img_draw_finish")))
+        except InterruptedError:
+            self.root.after(0, lambda: self.log(self.tr("log_img_draw_cancel")))
+        except Exception as e:
+            err_str = str(e)
+            self.root.after(0, lambda msg=err_str: self.log(f"矢量绘图线程异常: {msg}"))
+        finally:
+            self.controller.send_hex_state_str("00000880808080")
+            self.root.after(0, lambda: self.import_img_btn.config(state="normal"))
+            self.root.after(0, lambda: self.draw_img_btn.config(state="normal"))
+            self.root.after(0, lambda: self.stop_draw_btn.config(state="disabled"))
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = SwiccAdvancedHostApp(root)
-    
     sv_ttk.set_theme("dark")
     
-    # 基础样式初始化配置 (12pt 字号作为全局默认基准线)
     style = ttk.Style()
     default_font = ("Segoe UI", 12)
     style.configure(".", font=default_font)
