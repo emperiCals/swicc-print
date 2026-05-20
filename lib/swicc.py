@@ -12,6 +12,7 @@ import pywinstyles
 import gc
 
 from swicc_core import SwiccController, Button, DPad
+from xbox_listener import XboxListener, PYGAME_AVAILABLE
 
 try:
     if platform.system() == "Windows":
@@ -71,7 +72,12 @@ I18N = {
         "btn_ota_update": "云端热重载主固件",
         "log_ota_start": "正在启动 OTA 固件覆写，文件大小 {} 字节...",
         "log_ota_success": "OTA 固件传输完成！硬件正在执行软重启应用新固件...",
-        "log_ota_fail": "OTA 固件下发失败。通信链路中断。"
+        "log_ota_fail": "OTA 固件下发失败。通信链路中断。",
+        "xbox_enable": "启动本地 Xbox 控制器透传",
+        "xbox_disable": "终止控制器硬件透传",
+        "log_xbox_start": "已挂载本地物理控制器，输入流已无缝桥接至串行总线。",
+        "log_xbox_stop": "已安全释放本地物理控制器。",
+        "log_xbox_fail": "硬件层异常：未检测到连接的 XInput 兼容控制器设备。"
     }
 }
 
@@ -150,12 +156,18 @@ class SwiccAdvancedHostApp:
         self.base_scaling = self.root.tk.call('tk', 'scaling')
         self.extracted_contours = None
         self.drawing_requested_cancel = threading.Event()
+        
+        self.xbox_listener = XboxListener(self.controller, DPad, Button, self.send_update)
+        
+        # 增加硬件更新节流时间戳、定时器标记与并发操作互斥锁
+        self._last_hardware_update_time = 0.0
+        self._update_timer_active = False
+        self._update_lock = threading.Lock()
 
         self.setup_ui()
         self.scan_ports()
         self.apply_language_strings()
         
-        # 使用内建引擎输出欢迎信息
         self.log_text.config(state="normal")
         self.log_text.insert("end", "\n================================================\n", "success")
         self.log_text.insert("end", "SwiCC Host Dashboard / Terminal Backend Ready\n", "success")
@@ -310,12 +322,14 @@ class SwiccAdvancedHostApp:
 
         self.btn_ota_update = ttk.Button(hw_control_frame, text="", command=self.ota_update_firmware, style="Accent.TButton")
         self.btn_ota_update.grid(row=0, column=3, padx=10, pady=5)
+        
+        self.xbox_btn = ttk.Button(hw_control_frame, text="", command=self.toggle_xbox_passthrough, style="Accent.TButton")
+        self.xbox_btn.grid(row=0, column=4, padx=10, pady=5)
 
         self.log_text = tk.Text(self.root, height=7, bg="#1e1e1e", font=("Microsoft YaHei", 12), relief="flat")
         self.log_text.grid(row=5, column=0, sticky="ew", padx=30, pady=(0, 30))
         self.log_text.config(state="disabled")
         
-        # 配置内建的高性能 Tag 渲染引擎 (完全替代 rich)
         self.log_text.tag_config("time", foreground="#888888")
         self.log_text.tag_config("info", foreground="#4cc9f0")
         self.log_text.tag_config("success", foreground="#00ff00", font=("Microsoft YaHei", 12, "bold"))
@@ -354,6 +368,11 @@ class SwiccAdvancedHostApp:
         self.btn_mode_macro.config(text=self.tr("btn_mode_macro"))
         self.btn_mode_burn.config(text=self.tr("btn_mode_burn"))
         self.btn_ota_update.config(text=self.tr("btn_ota_update"))
+        
+        if self.xbox_listener.is_running():
+            self.xbox_btn.config(text=self.tr("xbox_disable"))
+        else:
+            self.xbox_btn.config(text=self.tr("xbox_enable"))
 
     def change_language(self, event=None):
         selected = self.lang_var.get()
@@ -431,25 +450,49 @@ class SwiccAdvancedHostApp:
             self.log(self.tr("log_port_mount_fail", "端口被系统拒绝"), tag="error")
 
     def close_serial(self):
+        if self.xbox_listener.is_running():
+            self.toggle_xbox_passthrough()
+            
         self.controller.disconnect()
         self.is_connected = False
         self.connect_btn.config(text=self.tr("connect"))
         self.status_label.config(text=self.tr("status_unconnected"), foreground="#ff6b6b")
         self.log(self.tr("log_bus_detached"))
 
-    def send_update(self):
-        hex_str = self.controller.get_state_hex()
-        if self.is_connected:
-            self.controller.flush_state()
+    def send_update(self, force=False):
+        now_ts = time.time()
+        
+        # 引入限流机制，避免串口通讯堵塞（15ms/次 最大发送频率，约66Hz）
+        if not force and (now_ts - self._last_hardware_update_time < 0.015):
+            # 记录有未发送的更新，并设置尾随定时器(Trailing Edge Update)
+            if not getattr(self, '_update_timer_active', False):
+                self._update_timer_active = True
+                # 延时5ms后强制触发一次更新，确保最后一次状态（松开摇杆的回中指令）不被永久丢弃
+                threading.Timer(0.005, self._execute_delayed_update).start()
+            return
+            
+        self._execute_update()
 
-        if self.is_recording:
-            now = time.time()
-            if hex_str != self.last_hex_str:
-                duration_ms = int((now - self.current_step_start) * 1000)
-                if duration_ms > 0:
-                    self.macro_steps.append({"state": self.last_hex_str, "duration": duration_ms, "interval": 0})
-                self.current_step_start = now
-                self.last_hex_str = hex_str
+    def _execute_delayed_update(self):
+        self._update_timer_active = False
+        self._execute_update()
+
+    def _execute_update(self):
+        with getattr(self, '_update_lock', threading.Lock()):  # 线程安全的硬件状态刷写
+            self._last_hardware_update_time = time.time()
+            
+            hex_str = self.controller.get_state_hex()
+            if self.is_connected:
+                self.controller.flush_state()
+
+            if self.is_recording:
+                now = time.time()
+                if hex_str != self.last_hex_str:
+                    duration_ms = int((now - self.current_step_start) * 1000)
+                    if duration_ms > 0:
+                        self.macro_steps.append({"state": self.last_hex_str, "duration": duration_ms, "interval": 0})
+                    self.current_step_start = now
+                    self.last_hex_str = hex_str
 
     def create_button(self, parent, text, btn_enum):
         btn = ttk.Button(parent, text=text)
@@ -752,6 +795,21 @@ class SwiccAdvancedHostApp:
         self.controller.switch_hardware_mode("+MODE_BURN")
         time.sleep(0.5)
         self.close_serial()
+
+    def toggle_xbox_passthrough(self):
+        if self.xbox_listener.is_running():
+            self.xbox_listener.stop()
+            self.xbox_btn.config(text=self.tr("xbox_enable"))
+            self.log(self.tr("log_xbox_stop"))
+        else:
+            if not PYGAME_AVAILABLE:
+                messagebox.showerror("Error", "缺少依赖包 pygame。请在系统终端执行 pip install pygame 安装底层库后重试。")
+                return
+            if self.xbox_listener.start():
+                self.xbox_btn.config(text=self.tr("xbox_disable"))
+                self.log(self.tr("log_xbox_start"), tag="success")
+            else:
+                self.log(self.tr("log_xbox_fail"), tag="error")
 
 if __name__ == "__main__":
     root = tk.Tk()
